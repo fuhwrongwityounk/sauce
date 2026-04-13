@@ -1,0 +1,567 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ==================================================================
+-- 1. CONFIGURATION & STATE VARIABLES
+-- ==================================================================
+
+-- Combat Settings
+local currentPunchSpeed = 1.7 
+local TargetHitboxSize = 3 
+local HitboxTransparency = 0.8 
+local HitGroundedEnabled = false 
+local AntiStunEnabled = false 
+
+-- Shell Settings
+local SolidShellEnabled = false
+local SolidShellSize = 5
+
+-- Movement Settings
+local WalkSpeed = 16
+local WS_Protection = true
+local isTriggerHeld = false
+
+-- System Caches
+local originalHRPProps = {}
+local punchConnCache = {}
+local HitboxVector = Vector3.new(TargetHitboxSize, TargetHitboxSize, TargetHitboxSize)
+local BlackColor = Color3.new(0,0,0)
+
+-- Local Character Caches
+local LocalCharacter = nil
+local LocalHumanoid = nil
+local LocalRoot = nil
+local StunConnection = nil
+
+-- ==================================================================
+-- 2. CHARACTER & MOVEMENT LOGIC
+-- ==================================================================
+
+local function onCharacterChildAdded(child)
+    if not AntiStunEnabled then return end
+    if child.Name == "Stun" or child.Name == "Slow" or child.Name == "Weight" or child.Name == "WeaveStun" then
+        task.defer(function() child:Destroy() end)
+    end
+end
+
+local function updateLocalCache(char)
+    LocalCharacter = char
+    LocalHumanoid = char:WaitForChild("Humanoid", 10)
+    LocalRoot = char:WaitForChild("HumanoidRootPart", 10)
+
+    if StunConnection then StunConnection:Disconnect() end
+    StunConnection = char.ChildAdded:Connect(onCharacterChildAdded)
+    
+    if LocalHumanoid then
+        LocalHumanoid.WalkSpeed = WalkSpeed 
+        
+        -- Permanent WalkSpeed connection 
+        LocalHumanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if WS_Protection and not isTriggerHeld and LocalHumanoid.WalkSpeed ~= WalkSpeed then
+                LocalHumanoid.WalkSpeed = WalkSpeed
+            end
+        end)
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(updateLocalCache)
+if LocalPlayer.Character then updateLocalCache(LocalPlayer.Character) end
+
+-- ==================================================================
+-- 3. COMBAT & ANIMATION LOGIC
+-- ==================================================================
+
+local punchIDs = {
+    ["rbxassetid://18312333191"] = true, ["rbxassetid://18312335714"] = true,
+    ["rbxassetid://18312338197"] = true, ["rbxassetid://18312340119"] = true,
+    ["rbxassetid://18312344029"] = true, ["rbxassetid://18312346524"] = true,
+    ["rbxassetid://18312348771"] = true, ["rbxassetid://18312351760"] = true,
+}
+
+local function safePunch(fn) pcall(fn) end
+
+local function isPunch(track)
+    if not track or not track.Animation then return false end
+    
+    local priority = track.Priority
+    if priority == Enum.AnimationPriority.Core or 
+       priority == Enum.AnimationPriority.Idle or 
+       priority == Enum.AnimationPriority.Movement then return false end
+       
+    local id = string.lower(tostring(track.Animation.AnimationId))
+    if punchIDs[id] then return true end
+    
+    local name = string.lower(track.Name)
+    return (string.find(name, "punch") or string.find(name, "swing") or string.find(name, "attack")) 
+       and not string.find(name, "walk") 
+       and not string.find(name, "run")
+end
+
+local function punchDisconnectKey(key)
+    local c = punchConnCache[key]
+    if c and c.Connected then pcall(function() c:Disconnect() end) end
+    punchConnCache[key] = nil
+end
+
+local function findLocalLive()
+    local live = workspace:FindFirstChild("Live")
+    if not live then return nil end
+    local myModel = live:FindFirstChild(LocalPlayer.Name)
+    if not myModel then return nil end
+    local hum = myModel:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    local anim = hum:FindFirstChildOfClass("Animator")
+    return myModel, hum, anim
+end
+
+local function applyPunchSpeedToLocalLive(mult)
+    if mult then currentPunchSpeed = math.max(mult, 1.7) end
+    
+    local myModel, hum, anim = findLocalLive()
+    if not myModel then return end
+    
+    if anim then
+        punchDisconnectKey(anim)
+        for _, t in ipairs(anim:GetPlayingAnimationTracks()) do
+            if isPunch(t) then safePunch(function() t:AdjustSpeed(currentPunchSpeed) end) end
+        end
+        punchConnCache[anim] = anim.ChildAdded:Connect(function(ch)
+            if ch:IsA("AnimationTrack") and isPunch(ch) then 
+                safePunch(function() ch:AdjustSpeed(currentPunchSpeed) end) 
+            end
+        end)
+    end
+    
+    if hum then
+        punchDisconnectKey(hum)
+        punchConnCache[hum] = hum.AnimationPlayed:Connect(function(t)
+            if isPunch(t) then safePunch(function() t:AdjustSpeed(currentPunchSpeed) end) end
+        end)
+    end
+end
+
+local function startRespawnMonitor()
+    local function hookLiveFolder(folder)
+        folder.ChildAdded:Connect(function(child)
+            if child.Name == LocalPlayer.Name then
+                task.wait(0.5)
+                applyPunchSpeedToLocalLive(currentPunchSpeed)
+            end
+        end)
+    end
+
+    local existingLive = workspace:FindFirstChild("Live")
+    if existingLive then hookLiveFolder(existingLive) end
+
+    workspace.ChildAdded:Connect(function(c)
+        if c.Name == "Live" then hookLiveFolder(c) end
+    end)
+end
+
+task.spawn(startRespawnMonitor)
+task.spawn(function() applyPunchSpeedToLocalLive(currentPunchSpeed) end)
+
+-- ==================================================================
+-- 4. HITBOX & SHELL UTILITIES
+-- ==================================================================
+
+Players.PlayerRemoving:Connect(function(leavingPlayer)
+    if originalHRPProps[leavingPlayer] then
+        originalHRPProps[leavingPlayer] = nil
+    end
+end)
+
+local function resetHRP(targetPlayer, char)
+    local props = originalHRPProps[targetPlayer]
+    if props and char then
+        local Root = char:FindFirstChild("HumanoidRootPart")
+        if Root then
+            if Root.Size ~= props.Size then Root.Size = props.Size end
+            if Root.Transparency ~= props.Transparency then Root.Transparency = props.Transparency end
+            if Root.CanCollide ~= props.CanCollide then Root.CanCollide = props.CanCollide end
+            if Root.Color ~= props.Color then Root.Color = props.Color end
+            Root.CanTouch = true
+            Root.CanQuery = true
+            
+            local shell = Root:FindFirstChild("SolidShell")
+            if shell then shell:Destroy() end
+        end
+    end
+end
+
+local function updateHitbox(targetPlayer, liveFolder)
+    if targetPlayer == LocalPlayer then return end
+    
+    local char = targetPlayer.Character
+    if not char then return end
+    
+    local Root = char:FindFirstChild("HumanoidRootPart")
+    local Hum = char:FindFirstChild("Humanoid")
+    if not Root or not Hum then return end
+
+    local isKnocked = Hum.Health <= 0
+    if not isKnocked and liveFolder then
+        local entry = liveFolder:FindFirstChild(targetPlayer.Name)
+        if entry then
+            local knockedVal = entry:FindFirstChild("Knocked")
+            if knockedVal and knockedVal.Value == true then
+                isKnocked = true
+            end
+        end
+    end
+
+    local shouldApplyHitbox = (not isKnocked or HitGroundedEnabled)
+
+    -- Solid Shell Logic
+    local shell = Root:FindFirstChild("SolidShell")
+    if SolidShellEnabled and shouldApplyHitbox then
+        if not shell then
+            shell = Instance.new("Part", Root)
+            shell.Name = "SolidShell"
+            shell.Transparency = 1
+            shell.CanCollide = true 
+            shell.Massless = true
+        end
+        shell.Size = Vector3.new(SolidShellSize, SolidShellSize, SolidShellSize)
+        shell.CFrame = Root.CFrame
+    else
+        if shell then shell:Destroy() end
+    end
+
+    -- Hitbox Logic
+    if shouldApplyHitbox and TargetHitboxSize > 2 then
+        if not originalHRPProps[targetPlayer] then
+            originalHRPProps[targetPlayer] = {
+                Size = Root.Size,
+                Transparency = Root.Transparency,
+                CanCollide = Root.CanCollide,
+                Color = Root.Color 
+            }
+        end
+
+        if Root.Size ~= HitboxVector then Root.Size = HitboxVector end
+        if Root.Transparency ~= HitboxTransparency then Root.Transparency = HitboxTransparency end
+        if Root.Color ~= BlackColor then Root.Color = BlackColor end
+        
+        if Root.CanCollide then Root.CanCollide = false end
+        if not Root.CanTouch then Root.CanTouch = true end
+        if not Root.CanQuery then Root.CanQuery = true end
+    else
+        resetHRP(targetPlayer, char)
+    end
+end
+
+local liveFolder = workspace:FindFirstChild("Live")
+workspace.ChildAdded:Connect(function(c) if c.Name == "Live" then liveFolder = c end end)
+
+local lastHitboxUpdate = 0
+local hitboxUpdateRate = 0.08
+
+RunService.Heartbeat:Connect(function(dt)
+    lastHitboxUpdate = lastHitboxUpdate + dt
+    if lastHitboxUpdate >= hitboxUpdateRate then
+        lastHitboxUpdate = 0
+        local allPlayers = Players:GetPlayers()
+        for i = 1, #allPlayers do
+            updateHitbox(allPlayers[i], liveFolder)
+        end
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonL2 then isTriggerHeld = true end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonL2 then isTriggerHeld = false end
+end)
+
+-- ==================================================================
+-- 5. GUI CONSTRUCTION (BLACK & WHITE)
+-- ==================================================================
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "BENJI_SAUCE_GUI"
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+ScreenGui.ResetOnSpawn = false
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 300, 0, 480) 
+MainFrame.Position = UDim2.new(0.5, -150, 0.5, -240)
+MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Visible = true 
+MainFrame.Parent = ScreenGui
+MainFrame.ClipsDescendants = true
+
+local MainCorner = Instance.new("UICorner", MainFrame)
+MainCorner.CornerRadius = UDim.new(0, 8)
+
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Thickness = 1.5
+MainStroke.Color = Color3.fromRGB(255, 255, 255) 
+MainStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 45)
+Header.BackgroundColor3 = Color3.fromRGB(10, 10, 10) 
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+
+local HeaderCorner = Instance.new("UICorner", Header)
+HeaderCorner.CornerRadius = UDim.new(0, 8)
+
+local HeaderCap = Instance.new("Frame")
+HeaderCap.Size = UDim2.new(1, 0, 0, 2)
+HeaderCap.Position = UDim2.new(0, 0, 1, -2)
+HeaderCap.BackgroundColor3 = Color3.fromRGB(255, 255, 255) 
+HeaderCap.BorderSizePixel = 0
+HeaderCap.Parent = Header
+
+local Title = Instance.new("TextLabel")
+Title.Text = "BENJI SAUCE"
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 18
+Title.TextColor3 = Color3.fromRGB(255, 255, 255) 
+Title.Size = UDim2.new(1, 0, 1, 0)
+Title.BackgroundTransparency = 1
+Title.Parent = Header
+
+local Container = Instance.new("ScrollingFrame")
+Container.Size = UDim2.new(1, -20, 1, -65)
+Container.Position = UDim2.new(0, 10, 0, 55)
+Container.BackgroundTransparency = 1
+Container.ScrollBarThickness = 3
+Container.ScrollBarImageColor3 = Color3.fromRGB(255, 255, 255) 
+Container.Parent = MainFrame
+
+local UIList = Instance.new("UIListLayout", Container)
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.Padding = UDim.new(0, 10)
+
+-- UI Element Generators
+local function createCategory(name)
+    local Label = Instance.new("TextLabel")
+    Label.Text = name:upper()
+    Label.Font = Enum.Font.GothamBlack
+    Label.TextSize = 14
+    Label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Label.Size = UDim2.new(1, 0, 0, 25)
+    Label.BackgroundTransparency = 1
+    Label.TextXAlignment = Enum.TextXAlignment.Center
+    Label.Parent = Container
+end
+
+local function createSettingRow(name, defaultVal, callback)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -5, 0, 50)
+    Row.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    Row.Parent = Container
+    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIStroke", Row).Color = Color3.fromRGB(80, 80, 80)
+    Instance.new("UIStroke", Row).Thickness = 1
+
+    local Label = Instance.new("TextLabel")
+    Label.Text = name:upper()
+    Label.Font = Enum.Font.GothamMedium
+    Label.TextSize = 12
+    Label.TextColor3 = Color3.fromRGB(240, 240, 240)
+    Label.Size = UDim2.new(0.6, 0, 1, 0)
+    Label.Position = UDim2.new(0, 15, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+
+    local Input = Instance.new("TextBox")
+    Input.Size = UDim2.new(0, 60, 0, 30)
+    Input.Position = UDim2.new(1, -75, 0.5, -15)
+    Input.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    Input.Text = tostring(defaultVal)
+    Input.TextColor3 = Color3.fromRGB(255, 255, 255) 
+    Input.Font = Enum.Font.GothamBold
+    Input.Parent = Row
+    Instance.new("UICorner", Input).CornerRadius = UDim.new(0, 4)
+    Instance.new("UIStroke", Input).Color = Color3.fromRGB(255, 255, 255) 
+
+    Input.FocusLost:Connect(function()
+        local n = tonumber(Input.Text)
+        if n then callback(n) end
+    end)
+end
+
+local function createSliderRow(name, min, max, default, callback)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -5, 0, 60) 
+    Row.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    Row.Parent = Container
+    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIStroke", Row).Color = Color3.fromRGB(80, 80, 80)
+    Instance.new("UIStroke", Row).Thickness = 1
+
+    local Label = Instance.new("TextLabel")
+    Label.Text = name:upper()
+    Label.Font = Enum.Font.GothamMedium
+    Label.TextSize = 12
+    Label.TextColor3 = Color3.fromRGB(240, 240, 240)
+    Label.Size = UDim2.new(1, -20, 0, 25)
+    Label.Position = UDim2.new(0, 15, 0, 5)
+    Label.BackgroundTransparency = 1
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+
+    local ValueLabel = Instance.new("TextLabel")
+    ValueLabel.Text = tostring(default)
+    ValueLabel.Font = Enum.Font.GothamBold
+    ValueLabel.TextSize = 12
+    ValueLabel.TextColor3 = Color3.fromRGB(255, 255, 255) 
+    ValueLabel.Size = UDim2.new(0, 50, 0, 25)
+    ValueLabel.Position = UDim2.new(1, -65, 0, 5)
+    ValueLabel.BackgroundTransparency = 1
+    ValueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    ValueLabel.Parent = Row
+
+    local SliderBG = Instance.new("Frame")
+    SliderBG.Size = UDim2.new(1, -30, 0, 6)
+    SliderBG.Position = UDim2.new(0, 15, 0, 40)
+    SliderBG.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    SliderBG.Parent = Row
+    Instance.new("UICorner", SliderBG).CornerRadius = UDim.new(0, 3)
+    Instance.new("UIStroke", SliderBG).Color = Color3.fromRGB(80, 80, 80)
+
+    local SliderFill = Instance.new("Frame")
+    SliderFill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    SliderFill.BackgroundColor3 = Color3.fromRGB(255, 255, 255) 
+    SliderFill.Parent = SliderBG
+    Instance.new("UICorner", SliderFill).CornerRadius = UDim.new(0, 3)
+
+    local Trigger = Instance.new("TextButton")
+    Trigger.Size = UDim2.new(1, 0, 1, 0)
+    Trigger.BackgroundTransparency = 1
+    Trigger.Text = ""
+    Trigger.Parent = SliderBG
+
+    local isDragging = false
+    local function update(input)
+        local pos = input.Position.X
+        local relativePos = pos - SliderBG.AbsolutePosition.X
+        local percentage = math.clamp(relativePos / SliderBG.AbsoluteSize.X, 0, 1)
+        local value = math.floor((min + (max - min) * percentage) * 10) / 10 
+        SliderFill.Size = UDim2.new(percentage, 0, 1, 0)
+        ValueLabel.Text = tostring(value)
+        callback(value)
+    end
+    Trigger.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            isDragging = true
+            update(input)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then isDragging = false end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if isDragging and input.UserInputType == Enum.UserInputType.MouseMovement then update(input) end
+    end)
+end
+
+local function createToggleRow(name, default, callback)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -5, 0, 50)
+    Row.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    Row.Parent = Container
+    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIStroke", Row).Color = Color3.fromRGB(80, 80, 80)
+    Instance.new("UIStroke", Row).Thickness = 1
+
+    local Label = Instance.new("TextLabel")
+    Label.Text = name:upper()
+    Label.Font = Enum.Font.GothamMedium
+    Label.TextSize = 12
+    Label.TextColor3 = Color3.fromRGB(240, 240, 240)
+    Label.Size = UDim2.new(0.6, 0, 1, 0)
+    Label.Position = UDim2.new(0, 15, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+
+    local ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Size = UDim2.new(0, 28, 0, 28)
+    ToggleBtn.Position = UDim2.new(1, -43, 0.5, -14)
+    ToggleBtn.BackgroundColor3 = default and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(10, 10, 10)
+    ToggleBtn.Text = ""
+    ToggleBtn.Parent = Row
+    Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 4)
+    local Stroke = Instance.new("UIStroke", ToggleBtn)
+    Stroke.Color = Color3.fromRGB(255, 255, 255) 
+    Stroke.Thickness = 1
+
+    local toggled = default
+    ToggleBtn.MouseButton1Click:Connect(function()
+        toggled = not toggled
+        ToggleBtn.BackgroundColor3 = toggled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(10, 10, 10)
+        callback(toggled)
+    end)
+end
+
+-- ==================================================================
+-- 6. POPULATE GUI (SORTED CATEGORIES)
+-- ==================================================================
+
+-- COMBAT SECTION
+createCategory("Combat Things")
+
+createSettingRow("Punch Speed", currentPunchSpeed, function(val)
+    local speed = math.max(val, 1.7) 
+    applyPunchSpeedToLocalLive(speed)
+end)
+
+createSliderRow("Hitbox Size", 1, 9, TargetHitboxSize, function(val)
+    TargetHitboxSize = val
+    HitboxVector = Vector3.new(val, val, val)
+end)
+
+createSettingRow("Transparency", tostring(HitboxTransparency), function(val)
+    HitboxTransparency = tonumber(val) or 0.8
+end)
+
+createToggleRow("Hit Grounded", false, function(state) 
+    HitGroundedEnabled = state 
+end)
+
+createToggleRow("Anti Stun", false, function(state) 
+    AntiStunEnabled = state 
+end)
+
+createToggleRow("Solid Shell", false, function(state) 
+    SolidShellEnabled = state 
+end)
+
+createSliderRow("Solid Shell Size", 2, 15, SolidShellSize, function(val)
+    SolidShellSize = val
+end)
+
+-- MOVEMENT SECTION
+createCategory("Movement Things")
+
+createSettingRow("Walk Speed", tostring(WalkSpeed), function(val)
+    WalkSpeed = tonumber(val) or 16
+    if LocalHumanoid then LocalHumanoid.WalkSpeed = WalkSpeed end
+end)
+
+createToggleRow("WS Protection", true, function(state) 
+    WS_Protection = state 
+end)
+
+-- Toggle Menu Visibility with 'M'
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.M then
+        MainFrame.Visible = not MainFrame.Visible
+    end
+end)
