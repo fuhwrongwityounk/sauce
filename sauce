@@ -14,6 +14,7 @@ local TargetHitboxSize = 3
 local HitboxTransparency = 0.8 
 local HitGroundedEnabled = false 
 local AntiStunEnabled = false 
+local MaxHitboxDistance = 20 -- Hitboxes only render within this radius
 
 -- Shell Settings
 local SolidShellEnabled = false
@@ -24,11 +25,16 @@ local WalkSpeed = 16
 local WS_Protection = true
 local isTriggerHeld = false
 
+-- Weave Glide Settings
+local WeaveGlideEnabled = false
+local WeaveDistance = 3
+
 -- System Caches
 local originalHRPProps = {}
 local punchConnCache = {}
 local HitboxVector = Vector3.new(TargetHitboxSize, TargetHitboxSize, TargetHitboxSize)
 local BlackColor = Color3.new(0,0,0)
+local ThemeRed = Color3.fromRGB(220, 40, 40) -- Black, White, and Red aesthetic
 
 -- Local Character Caches
 local LocalCharacter = nil
@@ -47,6 +53,26 @@ local function onCharacterChildAdded(child)
     end
 end
 
+local function hookWeaveGlide(char)
+    local hrp = char:WaitForChild("HumanoidRootPart", 10)
+    if not hrp then return end
+
+    hrp.ChildAdded:Connect(function(child)
+        if WeaveGlideEnabled and child:IsA("BodyPosition") and child:GetAttribute("m") == 1 then
+            local currentPos = child.Position
+            local hrpPos = hrp.Position
+            local direction = currentPos - hrpPos
+            local originalDistance = direction.Magnitude
+
+            if originalDistance > 0 then
+                local unitDir = direction.Unit
+                local newPosition = hrpPos + (unitDir * WeaveDistance)
+                child.Position = newPosition
+            end
+        end
+    end)
+end
+
 local function updateLocalCache(char)
     LocalCharacter = char
     LocalHumanoid = char:WaitForChild("Humanoid", 10)
@@ -54,6 +80,8 @@ local function updateLocalCache(char)
 
     if StunConnection then StunConnection:Disconnect() end
     StunConnection = char.ChildAdded:Connect(onCharacterChildAdded)
+    
+    hookWeaveGlide(char)
     
     if LocalHumanoid then
         LocalHumanoid.WalkSpeed = WalkSpeed 
@@ -264,9 +292,36 @@ RunService.Heartbeat:Connect(function(dt)
     lastHitboxUpdate = lastHitboxUpdate + dt
     if lastHitboxUpdate >= hitboxUpdateRate then
         lastHitboxUpdate = 0
+        
         local allPlayers = Players:GetPlayers()
+        local myChar = LocalPlayer.Character
+        local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+
         for i = 1, #allPlayers do
-            updateHitbox(allPlayers[i], liveFolder)
+            local targetPlayer = allPlayers[i]
+            
+            if targetPlayer ~= LocalPlayer then
+                local inRange = false
+                local targetChar = targetPlayer.Character
+                local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+                
+                -- Distance check to heavily reduce lag
+                if myRoot and targetRoot then
+                    local distance = (myRoot.Position - targetRoot.Position).Magnitude
+                    if distance <= MaxHitboxDistance then
+                        inRange = true
+                    end
+                end
+
+                if inRange then
+                    updateHitbox(targetPlayer, liveFolder)
+                else
+                    -- Player is out of 20m radius, instantly reset their properties to save FPS
+                    if targetChar then
+                        resetHRP(targetPlayer, targetChar)
+                    end
+                end
+            end
         end
     end
 end)
@@ -281,7 +336,7 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 -- ==================================================================
--- 5. GUI CONSTRUCTION (BLACK & WHITE)
+-- 5. GUI CONSTRUCTION
 -- ==================================================================
 
 local ScreenGui = Instance.new("ScreenGui")
@@ -320,7 +375,7 @@ HeaderCorner.CornerRadius = UDim.new(0, 8)
 local HeaderCap = Instance.new("Frame")
 HeaderCap.Size = UDim2.new(1, 0, 0, 2)
 HeaderCap.Position = UDim2.new(0, 0, 1, -2)
-HeaderCap.BackgroundColor3 = Color3.fromRGB(255, 255, 255) 
+HeaderCap.BackgroundColor3 = ThemeRed
 HeaderCap.BorderSizePixel = 0
 HeaderCap.Parent = Header
 
@@ -338,7 +393,7 @@ Container.Size = UDim2.new(1, -20, 1, -65)
 Container.Position = UDim2.new(0, 10, 0, 55)
 Container.BackgroundTransparency = 1
 Container.ScrollBarThickness = 3
-Container.ScrollBarImageColor3 = Color3.fromRGB(255, 255, 255) 
+Container.ScrollBarImageColor3 = ThemeRed
 Container.Parent = MainFrame
 
 local UIList = Instance.new("UIListLayout", Container)
@@ -419,7 +474,7 @@ local function createSliderRow(name, min, max, default, callback)
     ValueLabel.Text = tostring(default)
     ValueLabel.Font = Enum.Font.GothamBold
     ValueLabel.TextSize = 12
-    ValueLabel.TextColor3 = Color3.fromRGB(255, 255, 255) 
+    ValueLabel.TextColor3 = ThemeRed
     ValueLabel.Size = UDim2.new(0, 50, 0, 25)
     ValueLabel.Position = UDim2.new(1, -65, 0, 5)
     ValueLabel.BackgroundTransparency = 1
@@ -436,7 +491,7 @@ local function createSliderRow(name, min, max, default, callback)
 
     local SliderFill = Instance.new("Frame")
     SliderFill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
-    SliderFill.BackgroundColor3 = Color3.fromRGB(255, 255, 255) 
+    SliderFill.BackgroundColor3 = ThemeRed 
     SliderFill.Parent = SliderBG
     Instance.new("UICorner", SliderFill).CornerRadius = UDim.new(0, 3)
 
@@ -493,7 +548,7 @@ local function createToggleRow(name, default, callback)
     local ToggleBtn = Instance.new("TextButton")
     ToggleBtn.Size = UDim2.new(0, 28, 0, 28)
     ToggleBtn.Position = UDim2.new(1, -43, 0.5, -14)
-    ToggleBtn.BackgroundColor3 = default and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(10, 10, 10)
+    ToggleBtn.BackgroundColor3 = default and ThemeRed or Color3.fromRGB(10, 10, 10)
     ToggleBtn.Text = ""
     ToggleBtn.Parent = Row
     Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 4)
@@ -504,13 +559,13 @@ local function createToggleRow(name, default, callback)
     local toggled = default
     ToggleBtn.MouseButton1Click:Connect(function()
         toggled = not toggled
-        ToggleBtn.BackgroundColor3 = toggled and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(10, 10, 10)
+        ToggleBtn.BackgroundColor3 = toggled and ThemeRed or Color3.fromRGB(10, 10, 10)
         callback(toggled)
     end)
 end
 
 -- ==================================================================
--- 6. POPULATE GUI (SORTED CATEGORIES)
+-- 6. POPULATE GUI
 -- ==================================================================
 
 -- COMBAT SECTION
@@ -556,6 +611,15 @@ end)
 
 createToggleRow("WS Protection", true, function(state) 
     WS_Protection = state 
+end)
+
+-- NEW WEAVE GLIDE SECTION
+createToggleRow("Weave Glide", false, function(state)
+    WeaveGlideEnabled = state
+end)
+
+createSliderRow("Weave Distance", 1, 10, WeaveDistance, function(val)
+    WeaveDistance = val
 end)
 
 -- Toggle Menu Visibility with 'M'
